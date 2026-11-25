@@ -22,20 +22,50 @@ export function seedPersonas() {
   }
 }
 
+const TRAIT_SEED_KEYS = ['outgoing', 'agreeableness', 'conscientiousness', 'emotionality', 'openness']
+
 export function parsePersona(id, raw) {
   let text = String(raw || '').replace(/^﻿/, '')
   const meta = { id, name: id, tags: [] }
+  let personality = null
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
   if (m) {
+    let inPersonality = false
     for (const line of m[1].split(/\r?\n/)) {
+      if (inPersonality) {
+        const sub = line.match(/^\s+([a-zA-Z_]+):\s*([+-]?\d+(?:\.\d+)?)\s*$/)
+        if (sub) {
+          if (TRAIT_SEED_KEYS.includes(sub[1])) {
+            if (!personality) personality = {}
+            personality[sub[1]] = Number(sub[2])
+          }
+          continue
+        }
+        if (/^\s*(?:#.*)?$/.test(line)) continue
+        inPersonality = false
+      }
       const kv = line.match(/^(\w+):\s*(.*)$/)
       if (!kv) continue
       if (kv[1] === 'name') meta.name = kv[2].trim()
-      if (kv[1] === 'tags') meta.tags = kv[2].replace(/^\[|\]$/g, '').split(/[,，]/).map((s) => s.trim()).filter(Boolean)
+      else if (kv[1] === 'tags') meta.tags = kv[2].replace(/^\[|\]$/g, '').split(/[,，]/).map((s) => s.trim()).filter(Boolean)
+      else if (kv[1] === 'personality') {
+        const inline = kv[2].trim()
+        if (!inline) {
+          inPersonality = true
+        } else if (inline.startsWith('{') && inline.endsWith('}')) {
+          for (const part of inline.slice(1, -1).split(/[,，]/)) {
+            const pkv = part.match(/^\s*([a-zA-Z_]+)\s*:\s*([+-]?\d+(?:\.\d+)?)\s*$/)
+            if (pkv && TRAIT_SEED_KEYS.includes(pkv[1])) {
+              if (!personality) personality = {}
+              personality[pkv[1]] = Number(pkv[2])
+            }
+          }
+        }
+      }
     }
     text = text.slice(m[0].length)
   }
-  return { ...meta, body: text.trim() }
+  return { ...meta, ...(personality ? { personality } : {}), body: text.trim() }
 }
 
 const safeId = (id) => String(id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40)
@@ -60,16 +90,58 @@ export function readPersona(id) {
   seedPersonas()
   const f = join(dir(), `${safeId(id)}.md`)
   if (!existsSync(f)) return null
-  return { ...parsePersona(safeId(id), readFileSync(f, 'utf8')), raw: readFileSync(f, 'utf8') }
+  const raw = readFileSync(f, 'utf8')
+  return { ...parsePersona(safeId(id), raw), raw }
 }
 
-export function savePersona(id, { name, tags, body }) {
+/** 读取角色元数据与性格种子；数据目录只读不可用时自动回退读取内置人格卡。 */
+export function readPersonaMeta(id) {
+  const sid = safeId(id) || 'dafeiyu'
+  const fromData = (() => { try { return readPersona(sid) } catch { return null } })()
+  if (fromData) {
+    return {
+      id: sid,
+      name: fromData.name,
+      tags: fromData.tags,
+      personalitySeeds: fromData.personality || null,
+      body: fromData.body,
+    }
+  }
+  try {
+    const bf = join(BUNDLED, `${sid}.md`)
+    if (existsSync(bf)) {
+      const parsed = parsePersona(sid, readFileSync(bf, 'utf8'))
+      return {
+        id: sid,
+        name: parsed.name,
+        tags: parsed.tags,
+        personalitySeeds: parsed.personality || null,
+        body: parsed.body,
+      }
+    }
+  } catch {}
+  return { id: sid, name: sid, tags: [], personalitySeeds: null, body: '' }
+}
+
+export function savePersona(id, { name, tags, body, personality }) {
   const sid = safeId(id)
   if (!sid) throw new Error('人格 id 只能用英文字母、数字、- 和 _')
   if (!String(body || '').trim()) throw new Error('人格内容不能是空的')
+  const prevSeeds = personality === undefined ? readPersona(sid)?.personality : personality
+  const seedLines = prevSeeds && typeof prevSeeds === 'object'
+    ? TRAIT_SEED_KEYS
+      .filter((k) => Number.isFinite(Number(prevSeeds[k])))
+      .map((k) => `  ${k}: ${Number(prevSeeds[k])}`)
+    : []
   mkdirSync(dir(), { recursive: true })
-  const head = `---\nname: ${String(name || sid).replace(/\n/g, ' ')}\ntags: [${(tags || []).join(', ')}]\n---\n\n`
-  writeFileSync(join(dir(), `${sid}.md`), head + String(body).trim() + '\n', 'utf8')
+  const headLines = [
+    '---',
+    `name: ${String(name || sid).replace(/\n/g, ' ')}`,
+    `tags: [${(tags || []).join(', ')}]`,
+    ...(seedLines.length ? ['personality:', ...seedLines] : []),
+    '---',
+  ]
+  writeFileSync(join(dir(), `${sid}.md`), headLines.join('\n') + '\n\n' + String(body).trim() + '\n', 'utf8')
   return readPersona(sid)
 }
 

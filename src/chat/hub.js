@@ -78,9 +78,9 @@ export function assistantReplyText (message) {
   return message.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
 }
 
-export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf }) {
+export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, personaEngine, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf }) {
   // 心情对行为的影响（表情 / 语音概率、回复快慢、插话积极程度），没接就是 1
-  const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
+  const mood = (chat, sessionId) => (typeof moodEffects === 'function' ? moodEffects(chat, sessionId) : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
   const mapFile = () => dataDir('sessions.json')
   const map = () => readJson(mapFile(), () => ({ chats: {} }))
   const saveMap = (m) => writeJson(mapFile(), m)
@@ -962,13 +962,13 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     const texts = items.filter((i) => i.kind === 'text')
     if (cfg.voice.enabled && items.length === texts.length && texts.length > 0) {
       const all = texts.map((t) => t.value).join('，')
-      if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
+      if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood(chatId).voice) items = [{ kind: 'voice', value: all }]
     }
     const inGroup = chatId.startsWith('group:')
     // 群里别刷屏：一段最多 3 条
     if (inGroup && items.length > 3) items = items.slice(0, 3)
     // 按概率补一张表情（群里已经有两条以上就不补了）
-    if (cfg.stickers.enabled && !items.some((i) => i.kind === 'sticker') && !(inGroup && items.length >= 2) && Math.random() < cfg.stickers.autoChance * mood().sticker) {
+    if (cfg.stickers.enabled && !items.some((i) => i.kind === 'sticker') && !(inGroup && items.length >= 2) && Math.random() < cfg.stickers.autoChance * mood(chatId).sticker) {
       const pick = stickers.pickForReply(texts.map((t) => t.value).join(' '))
       if (pick) items.push({ kind: 'sticker', value: pick })
     }
@@ -1014,7 +1014,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
           if (localImageBlocked(chatId, it.value)) log.warn(`${chatId}：回复里的本机图片不在允许的目录里，没发`)
           else await sendImage(chatId, it.value, replyId, userId)
         }
-        if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
+        if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood(chatId).delay)
       }
     })
     if (disposed) return
@@ -1080,6 +1080,11 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       const sys = st.system
       const wantVoice = Boolean(st.wantVoice)
       const autoReply = st.autoReply
+      const turnSendersSnapshot = [...(st.senders || [])]
+      const turnDirectReq = st.directRequester
+      const turnTexts = st.turnUserTexts?.length ? st.turnUserTexts.join('\n') : (st.lastText || '')
+      st.turnUserTexts = st.pendingTurnUserTexts || []
+      st.pendingTurnUserTexts = []
       st.autoReply = null
       st.text = ''
       // 上一轮还在跑时新消息已经排队给「下一轮」：这一轮 turn/end 不能把下一轮的说话人清掉（#90）
@@ -1098,13 +1103,47 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       if (!completed) {
         const detail = String(d.reason?.error?.message || d.reason?.failure?.message || '').replace(/\s+/g, ' ').slice(0, 180)
         log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}${detail ? '：' + redact(detail) : ''}），不发`)
+        personaEngine?.releaseTurnSnapshot?.({ sessionId: key, chatId })
         release(chatId)
         return
       }
       if (chatId.startsWith('system:')) return // 已超时的后台轮次不能误发到 QQ
-      if (!text) return release(chatId)
+      if (!text) {
+        personaEngine?.releaseTurnSnapshot?.({ sessionId: key, chatId })
+        return release(chatId)
+      }
+      const finalizeTurnState = () => {
+        personaEngine?.releaseTurnSnapshot?.({ sessionId: key, chatId })
+        if (!personaEngine?.recordTurnExchange) return
+        const cfgNow = getConfig()
+        const inGroupChat = chatId.startsWith('group:')
+        const uid = inGroupChat
+          ? String(turnDirectReq?.uid || turnSendersSnapshot[0] || '')
+          : chatId.slice(8)
+        const allOwner = !inGroupChat
+          ? isOwner(cfgNow, uid)
+          : (turnSendersSnapshot.length > 0 && turnSendersSnapshot.every((u) => isOwner(cfgNow, u)))
+        personaEngine.recordTurnExchange({
+          eventId: `${key}:turn:${d.turn ?? Date.now()}`,
+          chatId,
+          chatKind: inGroupChat ? 'group' : 'private',
+          userId: uid,
+          who: allOwner ? (cfgNow.ownerName || '主人') : (inGroupChat ? '群友' : '好友'),
+          isOwner: allOwner,
+          directToBot: !inGroupChat || Boolean(turnDirectReq),
+          origin: String(turnTexts).startsWith('【系统提醒') ? 'proactive' : 'user',
+          userText: turnTexts,
+          botReply: text,
+          botSilent: /^\s*\[沉默\]\s*$/.test(text),
+        }).catch((error) => log.debug?.('状态引擎后台评估出错：', error.message))
+      }
       // 发完再放开：发送期间来的消息也攒到下一段
-      deliver(chatId, text, { wantVoice, autoReply, userText: st.lastText || '', own: true }).catch((error) => log.warn('发送出错：', error.message)).finally(() => release(chatId))
+      deliver(chatId, text, { wantVoice, autoReply, userText: turnTexts || st.lastText || '', own: true })
+        .catch((error) => log.warn('发送出错：', error.message))
+        .finally(() => {
+          finalizeTurnState()
+          release(chatId)
+        })
     }
   }
 
@@ -1459,7 +1498,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     if (msg.kind === 'group') {
       const pol0 = policyFor(cfg.group, cfg.group.overrides, msg.groupId)
       // 心情好更爱插话，心情差少插话
-      const pol = { ...pol0, interjectChance: Math.min(1, pol0.interjectChance * mood().chatty) }
+      const pol = { ...pol0, interjectChance: Math.min(1, pol0.interjectChance * mood(msg).chatty) }
       // 群里最近在聊的（窗口内最后几条）和她有多相关
       const recentTexts = (groupBuf.get(msg.groupId) || []).filter((x) => now - x.t < pol.activeWindowSec * 1000).slice(-6).map((x) => x.text)
       let memScore = 0
@@ -1971,6 +2010,16 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     // ⚠ 不能用 busy：flush 一开始就把 busy 置上了，否则会把这一批自己的说话人塞进下一轮，
     //    主人和群友混在一起会让「仅主人」判断误拒（sticker-owner 回归抓到过）。
     const queuedNextTurn = !opts.steer && running.has(chat.chatId)
+    if (chat.kind !== 'system' && !queuedNextTurn) {
+      personaEngine?.acquireTurnSnapshot?.({ chat, sessionId: key, reuseExisting: Boolean(opts.steer) })
+    }
+    if (opts.steer) {
+      st.turnUserTexts = [...(st.turnUserTexts || []), userText]
+    } else if (queuedNextTurn) {
+      st.pendingTurnUserTexts = [...(st.pendingTurnUserTexts || []), userText]
+    } else {
+      st.turnUserTexts = [userText]
+    }
     const addSender = (u) => {
       st.senders.add(String(u))
       if (queuedNextTurn) {

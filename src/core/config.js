@@ -79,6 +79,10 @@ export const DEFAULTS = {
     codex: { model: 'gpt-image-2', quality: 'auto', background: 'auto' },
   },
   persona: { current: 'dafeiyu' },
+  personaEngine: {
+    emotion: { enabled: true, llm: true, evalModel: { provider: '', model: '' } },
+    personality: { autoEvolve: false, cooldownDays: 7, minValidTurns: 30, maxDrift: 2.5 },
+  },
   // 主人私聊里问起群里的事：把最近 24 小时的群聊流水补进这一轮（默认关，开启前先把群加进白名单）
   group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerBrief: { enabled: false, lines: 12, groups: [] } },
   // 按群头衔不回：勾选的群里，专属头衔正好是 title 的成员（一般是别的机器人）说话、戳她都不理。没勾群就不起作用
@@ -441,6 +445,21 @@ export function normalize(raw) {
   c.mood.halfLifeHours = num(c.mood.halfLifeHours, 3, 0.1, BIG)
   c.mood.base = num(c.mood.base, 60, 0, 100)
   c.mood.judge = bool(c.mood.judge, false)
+  if (!isObj(c.personaEngine)) c.personaEngine = structuredClone(DEFAULTS.personaEngine)
+  if (!isObj(c.personaEngine.emotion)) c.personaEngine.emotion = structuredClone(DEFAULTS.personaEngine.emotion)
+  c.personaEngine.emotion.enabled = bool(c.personaEngine.emotion.enabled, true)
+  c.personaEngine.emotion.llm = bool(c.personaEngine.emotion.llm, true)
+  c.personaEngine.emotion.evalModel = (() => {
+    const m = isObj(c.personaEngine.emotion.evalModel) ? c.personaEngine.emotion.evalModel : {}
+    const provider = String(m.provider || '').trim()
+    const model = String(m.model || '').trim()
+    return provider && model ? { provider, model } : { provider: '', model: '' }
+  })()
+  if (!isObj(c.personaEngine.personality)) c.personaEngine.personality = structuredClone(DEFAULTS.personaEngine.personality)
+  c.personaEngine.personality.autoEvolve = bool(c.personaEngine.personality.autoEvolve, false)
+  c.personaEngine.personality.cooldownDays = num(c.personaEngine.personality.cooldownDays, 7, 1, 365)
+  c.personaEngine.personality.minValidTurns = Math.round(num(c.personaEngine.personality.minValidTurns, 30, 5, BIG))
+  c.personaEngine.personality.maxDrift = c.personaEngine.personality.maxDrift === null ? null : num(c.personaEngine.personality.maxDrift, 2.5, 0.5, 5)
   for (const k of ['tts', 'image', 'song', 'asr', 'video']) c.local[k] = bool(c.local[k], false)
   c.local.videoTimeoutMin = num(c.local.videoTimeoutMin, 20, 1, BIG)
   const b = c.bili

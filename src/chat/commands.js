@@ -1,6 +1,7 @@
 // QQ 里的主人命令：/silent /active 之类，直接在 QQ 上管她。只认主人；在总开关关着时也能用（所以 /on 才有用）。
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { TRAIT_KEYS, TRAIT_LABELS, EMOTION_DIMS, EMOTION_LABELS } from '../persona-engine/constants.js'
 
 /**
  * 解析命令：「/silent 30」→ { name: 'silent', arg: '30' }。不是命令返回 null。支持全角斜杠和中文别名。
@@ -32,7 +33,7 @@ const ALIASES = {
   正常: 'normal',
   模型: 'model', 换模型: 'model',
   唱: 'sing', 点歌: 'sing', 翻唱: 'sing',
-  状态: 'status', 心情: 'mood', 日记: 'diary', 记住: 'remember', 记一下: 'remember',
+  状态: 'status', 心情: 'mood', 性格: 'personality', 日记: 'diary', 记住: 'remember', 记一下: 'remember',
   搭话: 'speak', 主动搭话: 'speak',
   重开: 'reset', 开机: 'on', 关机: 'off', 帮助: 'help', 命令: 'help', h: 'help',
 }
@@ -47,7 +48,8 @@ const COMMANDS = {
   model: '看或换她用的模型：/model 看列表，/model 2 或 /model 名字 换，/model 默认 跟随 DSH',
   sing: '让她翻唱一首：/sing 小幸运 田馥甄；后面加 +12 / -3 之类可以变调（原唱是男声一般 +12）',
   status: '看她现在的状态',
-  mood: '看她现在的心情',
+  mood: '看或平复她现在的心情（/mood reset 平复回日常）',
+  personality: '看或管理她的五维性格（/personality eval 评估，/personality reset 恢复初始）',
   diary: '马上写一篇空间日记',
   remember: '让她记住一件事，如 /remember 我不吃香菜',
   speak: '管主动搭话白名单：/speak 看名单，/speak add QQ 号 加人，/speak del QQ 号 移除',
@@ -197,8 +199,60 @@ export async function runCommand(cmd, msg, deps) {
       if (!name) return '唱哪首？比如 /sing 小幸运 田馥甄'
       return deps.song.request({ song: name, pitch: m ? Number(m[2]) : undefined, chatId: msg.chatId }).message
     }
-    case 'mood':
-      return mood ? `现在${mood.label()}` : '心情模块关着'
+    case 'mood': {
+      const sub = String(cmd.arg || '').trim().toLowerCase()
+      if (/^(reset|平复|重置)$/.test(sub)) {
+        if (!deps.personaEngine) return '状态引擎未启用'
+        await deps.personaEngine.resetEmotion(undefined, { reason: '主人命令平复情绪' })
+        return '好啦，深呼吸一下，心情平复回平常状态了'
+      }
+      if (!mood) return '心情模块关着'
+      if (!deps.personaEngine) return `现在${mood.label()}`
+      const st = deps.personaEngine.getState(undefined, { chat: msg })
+      const dimParts = EMOTION_DIMS
+        .map((d) => ({ d, v: st.emotion.intensities[d] ?? 0, b: st.emotion.baselines[d] ?? 0 }))
+        .filter((x) => Math.abs(x.v - x.b) >= 0.25 || x.v >= 0.8)
+        .map((x) => `${EMOTION_LABELS[x.d]} ${x.v.toFixed(2)}${x.b > 0 ? `(底色${x.b.toFixed(2)})` : ''}`)
+      const srcReasons = Object.values(st.emotion.focal_sources || {}).filter((s) => s?.reason)
+      const lines = [
+        `现在${st.emotion.label}（v${st.emotion.version}）`,
+        dimParts.length ? `活跃维度：${dimParts.join(' · ')}` : '八维状态：处于平静日常底色',
+        ...(srcReasons.length ? [`最近缘由：${srcReasons[0].reason}`] : []),
+      ]
+      return lines.join('\n')
+    }
+    case 'personality': {
+      if (!deps.personaEngine) return '性格引擎未启用'
+      const sub = String(cmd.arg || '').trim().toLowerCase()
+      if (/^(reset|重置|初始)$/.test(sub)) {
+        const r = await deps.personaEngine.rollbackPersonality(undefined, { toSeed: true })
+        if (!r.ok) return '重置失败：' + (r.error || '未知原因')
+        const summary = TRAIT_KEYS.map((k) => `${TRAIT_LABELS[k]} ${r.state.traits[k].score}`).join(' · ')
+        return `已恢复到初始人设性格种子（v${r.state.version}）：\n${summary}`
+      }
+      if (/^(eval|evaluate|评估)$/.test(sub)) {
+        const r = await deps.personaEngine.evaluatePersonality(undefined, { force: true })
+        if (r.skipped === 'insufficient-evidence') return `最近积累的有效对话还不够（当前 ${r.sampledCount || 0} 条，至少需要 3 条），多聊几句再来评估吧`
+        if (!r.ok) return '性格评估未完成：' + (r.error || r.skipped || '未知原因')
+        if (!r.anyChanged) return `性格评估完成（v${r.state.version}）：近期表现与现有人格底色一致，无需微调`
+        const changed = TRAIT_KEYS
+          .filter((k) => r.deltas?.[k])
+          .map((k) => `${TRAIT_LABELS[k]} ${r.deltas[k] > 0 ? '+' : ''}${r.deltas[k]}`)
+          .join('，')
+        return `性格微调完成（v${r.state.version}）：${changed || '描述已更新'}`
+      }
+      const st = deps.personaEngine.getState()
+      const p = st.personality
+      const trendMap = { up: '↑', down: '↓', stable: '→', uncertain: '?' }
+      const lines = [
+        `当前五维性格（${st.personaName} · v${p.version}，距上次评估 ${p.turns_since_eval} 轮）：`,
+        ...TRAIT_KEYS.map((k) => {
+          const t = p.traits[k]
+          return `- ${TRAIT_LABELS[k]}：${t.score.toFixed(2)} ${trendMap[t.trend] || '→'}（初始 ${t.seed_score.toFixed(2)}，档位 ${t.tier >= 0 ? '+' + t.tier : t.tier}）`
+        }),
+      ]
+      return lines.join('\n')
+    }
     case 'diary': {
       if (!qzone) return '空间日记没开'
       const r = await qzone.writeDiary()

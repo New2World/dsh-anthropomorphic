@@ -27,7 +27,9 @@ import { mimeOf } from './chat/inbound.js'
 import { dataDir, ensureDir } from './core/store.js'
 import { createUpdateChecker, changelogSection } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
-import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
+import { listPersonas, readPersona, readPersonaMeta, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
+import { createPersonaEngine } from './persona-engine/index.js'
+import { registerPersonaEngineRoutes } from './persona-engine/routes.js'
 import { createModules, API_VERSION } from './core/modules.js'
 import { createCommunity } from './core/community.js'
 import { createApprovalRelay } from './security/approval.js'
@@ -87,13 +89,23 @@ export function apply(ctx) {
   }
   secrets()
   seedPersonas()
+  const personaEngine = createPersonaEngine({
+    dsh: ctx,
+    getConfig,
+    getPersonaMeta: (id) => readPersonaMeta(id || cfg.persona.current),
+    log: logger.child('persona'),
+  })
 
   // ---------- 人格与规则：通过提示词变量注入到 Aurabot 的两个 preset ----------
   const variable = (n, fn) => ctx.effect(() => ctx.systemPrompt.variable(n, (...args) => captureSystemPrompt(n, cleanText(fn(...args)))), `aurabot: 变量 ${n}`)
   const rulesOpts = (kind) => (mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {})
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
-  variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
+  variable('aurabot_persona', () => {
+    const base = currentPersonaText(cfg.persona.current)
+    const traitBlock = personaEngine.personaPrefixBlock(cfg.persona.current)
+    return rewrite('persona', traitBlock ? `${base}\n\n${traitBlock}` : base)
+  })
   variable('aurabot_rules_private', () => {
     const base = rewrite('rules', rulesText('private', cfg, rulesOpts('private')), 'private')
     // 危险命令确认开着时补一句：被拦下要如实告诉主人，别绕着写
@@ -282,10 +294,11 @@ export function apply(ctx) {
       const cmd = parseCommand(msg.text, mods.commands())
       if (!cmd) return null
       if (cmd.ext) return String((await cmd.ext.run(cmd.arg, msg)) ?? '')
-      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
+      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, mood: use('mood'), personaEngine, memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
     },
     isMuted: (chatId) => mutes.muted(chatId),
-    moodEffects: () => use('mood')?.effects?.() ?? null,
+    moodEffects: (chat, sessionId) => use('mood')?.effects?.(chat, sessionId) ?? null,
+    personaEngine,
     availableModels: () => modelCache,
     // 模块（重）启动代际：模块热重载后工具名没变、但实例换了，hub 要据此重挂工具（issue #73）
     toolsGeneration: () => (mods ? mods.generation?.() || 0 : 0),
@@ -504,13 +517,13 @@ export function apply(ctx) {
 
   // ---------- 模块 ----------
   const core = {
-    hub, onebot, snowluma, local, groupRoles, mutes, logger, bridge: null,
+    hub, onebot, snowluma, local, groupRoles, mutes, logger, personaEngine, bridge: null,
     root: ROOT,
     ask: (opts) => askModel(ctx, { cfg: getConfig(), ...opts }),
     listModels,
     defaultModel: () => defaultModel(ctx, { model: {} }),
     http: { body: readBody, raw: readRaw, query, send },
-    personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(cfg.persona.current) },
+    personas: { list: listPersonas, read: readPersona, meta: readPersonaMeta, current: () => currentPersonaText(cfg.persona.current) },
     getConfig, setConfig,
   }
   mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS })
@@ -780,6 +793,7 @@ export function apply(ctx) {
   const petStatus = () => redactTokens(use('pet')?.status?.() ?? null)
 
   route('/state', async () => overview())
+  registerPersonaEngineRoutes({ route, query, readBody, personaEngine })
 
   route('/save', async (req) => {
     const body = await readBody(req)
@@ -1578,7 +1592,7 @@ export function apply(ctx) {
   log.info(`Aurabot v${VERSION} 已加载｜总开关 ${cfg.enabled ? '开' : '关'}｜试运行 ${cfg.dryRun ? '开' : '关'}｜工作区 ${workspaceDirOf(cfg)}`)
 
   return {
-    hub, onebot, snowluma, getConfig, setConfig, logger, modules: mods, bridge, ready: booted,
+    hub, onebot, snowluma, getConfig, setConfig, logger, modules: mods, bridge, personaEngine, ready: booted,
     get stickers() { return use('stickers') },
     get qzone() { return use('diary') },
     get mood() { return use('mood') },
